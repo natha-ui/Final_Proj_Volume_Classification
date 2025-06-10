@@ -17,11 +17,9 @@ from collections import OrderedDict
 import multiprocessing
 import numpy as np
 import tensorflow as tf
-import keras
-import keras.backend as K
-import keras.layers as KL
-import keras.engine as KE
-import keras.models as KM
+from tensorflow.keras import layers as KL
+from tensorflow.keras import models as KM
+import tensorflow.keras.backend as K
 
 from food_volume_estimation.food_segmentation.mrcnn import utils
 
@@ -65,7 +63,7 @@ class BatchNorm(KL.BatchNormalization):
             False: Freeze BN layers. Good when batch size is small
             True: (don't use). Set layer in training mode even when making inferences
         """
-        return super(self.__class__, self).call(inputs, training=training)
+        return super().call(inputs, training=training)
 
 
 def compute_backbone_shapes(config, image_shape):
