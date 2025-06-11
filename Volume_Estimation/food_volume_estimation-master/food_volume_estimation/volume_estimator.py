@@ -12,7 +12,6 @@ from fuzzywuzzy import fuzz, process
 import matplotlib.pyplot as plt
 from food_volume_estimation.depth_estimation.custom_modules import *
 from food_volume_estimation.depth_estimation.project import *
-from food_volume_estimation.food_segmentation.food_segmentator import FoodSegmentator
 from food_volume_estimation.ellipse_detection.ellipse_detector import EllipseDetector
 from food_volume_estimation.point_cloud_utils import *
 
@@ -69,7 +68,7 @@ class DensityDatabase():
 class VolumeEstimator():
     """Volume estimator object."""
     def __init__(self, arg_init=True):
-        """Load depth model and create segmentator object.
+        """Load depth model.
 
         Inputs:
             arg_init: Flag to initialize volume estimator with
@@ -106,9 +105,6 @@ class VolumeEstimator():
             self.max_disp = 1 / self.args.min_depth
             self.gt_depth_scale = self.args.gt_depth_scale
 
-            # Create segmentator object
-            self.segmentator = FoodSegmentator(self.args.segmentation_weights)
-
             # Plate adjustment relaxation parameter
             self.relax_param = self.args.relaxation_param
 
@@ -139,10 +135,10 @@ class VolumeEstimator():
                             help='Depth estimation model weights (.h5).',
                             metavar='/path/to/weights.h5',
                             required=True)
-        parser.add_argument('--segmentation_weights', type=str,
-                            help='Food segmentation model weights (.h5).',
-                            metavar='/path/to/weights.h5',
-                            required=True)
+        parser.add_argument('--roi', type=int, nargs=4,
+                            help='Region of interest [x, y, width, height] or None for full image.',
+                            metavar='x y width height',
+                            default=None)
         parser.add_argument('--fov', type=float,
                             help='Camera Field of View (in deg).',
                             metavar='<fov>',
@@ -190,24 +186,22 @@ class VolumeEstimator():
                             default=None)
         args = parser.parse_args()
 
-
         return args
 
-    def estimate_volume(self, input_image, fov=70,  plate_diameter_prior=0.3,
-            plot_results=False, plots_directory=None):
+    def estimate_volume(self, input_image, fov=70, plate_diameter_prior=0.3,
+            roi=None, plot_results=False, plots_directory=None):
         """Volume estimation procedure.
 
         Inputs:
             input_image: Path to input image or image array.
             fov: Camera Field of View.
             plate_diameter_prior: Expected plate diameter.
+            roi: Region of interest [x, y, width, height] or None for full image.
             plot_results: Result plotting flag.
             plots_directory: Directory to save plots at or None.
         Returns:
             estimated_volume: Estimated volume.
         """
-        return_est_volume = 0.0
-
         # Load input image and resize to model input size
         if isinstance(input_image, str):
             img = cv2.imread(input_image, cv2.IMREAD_COLOR)
@@ -229,6 +223,7 @@ class VolumeEstimator():
         disparity_map = (self.min_disp + (self.max_disp - self.min_disp)
                          * inverse_depth)
         depth = 1 / disparity_map
+        
         # Convert depth map to point cloud
         depth_tensor = K.variable(np.expand_dims(depth, 0))
         intrinsics_inv_tensor = K.variable(np.expand_dims(intrinsics_inv, 0))
@@ -236,7 +231,7 @@ class VolumeEstimator():
         point_cloud_flat = np.reshape(
             point_cloud, (point_cloud.shape[1] * point_cloud.shape[2], 3))
 
-        # Find ellipse parameterss (cx, cy, a, b, theta) that
+        # Find ellipse parameters (cx, cy, a, b, theta) that
         # describe the plate contour
         ellipse_scale = 2
         ellipse_detector = EllipseDetector(
@@ -278,154 +273,161 @@ class VolumeEstimator():
             print('[*] No ellipse found. Scaling with expected median depth.')
             predicted_median_depth = np.median(1 / disparity_map)
             scaling = self.gt_depth_scale / predicted_median_depth
+            
         depth = scaling * depth
         point_cloud = scaling * point_cloud
         point_cloud_flat = scaling * point_cloud_flat
 
-        # Predict segmentation masks
-        masks_array = self.segmentator.infer_masks(input_image)
-        print('[*] Found {} food object(s) '
-              'in image.'.format(masks_array.shape[-1]))
+        # Create object mask based on ROI or use entire image
+        if roi is not None:
+            # Scale ROI to model input dimensions
+            x_scale = self.model_input_shape[1] / input_image_shape[1]
+            y_scale = self.model_input_shape[0] / input_image_shape[0]
+            
+            roi_scaled = [
+                int(roi[0] * x_scale),
+                int(roi[1] * y_scale),
+                int(roi[2] * x_scale),
+                int(roi[3] * y_scale)
+            ]
+            
+            # Create mask for ROI
+            object_mask = np.zeros((self.model_input_shape[0], self.model_input_shape[1]))
+            object_mask[roi_scaled[1]:roi_scaled[1]+roi_scaled[3], 
+                       roi_scaled[0]:roi_scaled[0]+roi_scaled[2]] = 1
+        else:
+            # Use entire image (excluding very low depth values which might be background)
+            depth_threshold = np.percentile(depth.flatten(), 10)  # Bottom 10% are likely background
+            object_mask = (depth > depth_threshold).astype(float)
 
-        # Iterate over all predicted masks and estimate volumes
-        estimated_volumes = []
-        for k in range(masks_array.shape[-1]):
-            # Apply mask to create object image and depth map
-            object_mask = cv2.resize(masks_array[:,:,k],
-                                     (self.model_input_shape[1],
-                                      self.model_input_shape[0]))
-            object_img = (np.tile(np.expand_dims(object_mask, axis=-1),
-                                     (1,1,3)) * img)
-            object_depth = object_mask * depth
-            # Get object/non-object points by filtering zero/non-zero
-            # depth pixels
-            object_mask = (np.reshape(
-                object_depth, (object_depth.shape[0] * object_depth.shape[1]))
-                > 0)
-            object_points = point_cloud_flat[object_mask, :]
-            non_object_points = point_cloud_flat[
-                np.logical_not(object_mask), :]
+        # Apply mask to create object image and depth map
+        object_img = (np.tile(np.expand_dims(object_mask, axis=-1), (1,1,3)) * img)
+        object_depth = object_mask * depth
+        
+        # Get object points by filtering zero/non-zero depth pixels
+        object_mask_flat = (np.reshape(object_depth, 
+            (object_depth.shape[0] * object_depth.shape[1])) > 0)
+        object_points = point_cloud_flat[object_mask_flat, :]
+        non_object_points = point_cloud_flat[np.logical_not(object_mask_flat), :]
 
-            # Filter outlier points
-            object_points_filtered, sor_mask = sor_filter(
-                object_points, 2, 0.7)
-            # Estimate base plane parameters
-            plane_params = pca_plane_estimation(object_points_filtered)
-            # Transform object to match z-axis with plane normal
-            translation, rotation_matrix = align_plane_with_axis(
-                plane_params, np.array([0, 0, 1]))
-            object_points_transformed = np.dot(
-                object_points_filtered + translation, rotation_matrix.T)
+        if len(object_points) == 0:
+            print('[*] No object points found. Cannot estimate volume.')
+            return 0.0
 
-            # Adjust object on base plane
-            height_sorted_indices = np.argsort(object_points_transformed[:,2])
-            adjustment_index = height_sorted_indices[
-                int(object_points_transformed.shape[0] * self.relax_param)]
-            object_points_transformed[:,2] += np.abs(
-                object_points_transformed[adjustment_index, 2])
+        # Filter outlier points
+        object_points_filtered, sor_mask = sor_filter(object_points, 2, 0.7)
+        
+        if len(object_points_filtered) == 0:
+            print('[*] No object points remaining after filtering. Cannot estimate volume.')
+            return 0.0
+            
+        # Estimate base plane parameters
+        plane_params = pca_plane_estimation(object_points_filtered)
+        
+        # Transform object to match z-axis with plane normal
+        translation, rotation_matrix = align_plane_with_axis(
+            plane_params, np.array([0, 0, 1]))
+        object_points_transformed = np.dot(
+            object_points_filtered + translation, rotation_matrix.T)
 
-            if (plot_results or plots_directory is not None):
-                # Create object points from estimated plane
-                plane_z = np.apply_along_axis(
-                    lambda x: ((plane_params[0] + plane_params[1] * x[0]
-                    + plane_params[2] * x[1]) * (-1) / plane_params[3]),
-                    axis=1, arr=point_cloud_flat[:,:2])
-                plane_points = np.concatenate(
-                    (point_cloud_flat[:,:2],
-                    np.expand_dims(plane_z, axis=-1)), axis=-1)
-                plane_points_transformed = np.dot(plane_points + translation,
-                                                  rotation_matrix.T)
-                print('[*] Estimated plane parameters (w0,w1,w2,w3):',
-                      plane_params)
+        # Adjust object on base plane
+        height_sorted_indices = np.argsort(object_points_transformed[:,2])
+        adjustment_index = height_sorted_indices[
+            int(object_points_transformed.shape[0] * self.relax_param)]
+        object_points_transformed[:,2] += np.abs(
+            object_points_transformed[adjustment_index, 2])
 
-                # Get the color values for the different sets of points
-                colors_flat = (
-                    np.reshape(img, (self.model_input_shape[0]
-                                     * self.model_input_shape[1], 3))
-                    * 255)
-                object_colors = colors_flat[object_mask, :]
-                non_object_colors= colors_flat[np.logical_not(object_mask), :]
-                object_colors_filtered = object_colors[sor_mask, :]
+        # Estimate volume for points above the plane
+        volume_points = object_points_transformed[
+            object_points_transformed[:,2] > 0]
+            
+        if len(volume_points) == 0:
+            print('[*] No volume points above base plane. Cannot estimate volume.')
+            return 0.0
+            
+        estimated_volume, simplices = pc_to_volume(volume_points)
+        print('[*] Estimated volume:', estimated_volume * 1000, 'L')
 
-                # Create dataFrames for the different sets of points
-                non_object_points_df = pd.DataFrame(
-                    np.concatenate((non_object_points, non_object_colors),
-                                   axis=-1),
-                    columns=['x','y','z','red','green','blue'])
-                object_points_df = pd.DataFrame(
-                    np.concatenate((object_points, object_colors),
-                    axis=-1), columns=['x','y','z','red','green','blue'])
-                plane_points_df = pd.DataFrame(
-                    plane_points, columns=['x','y','z'])
-                object_points_transformed_df = pd.DataFrame(
-                    np.concatenate((object_points_transformed,
-                                    object_colors_filtered), axis=-1),
-                    columns=['x','y','z','red','green','blue'])
-                plane_points_transformed_df = pd.DataFrame(
-                    plane_points_transformed, columns=['x','y','z'])
+        if plot_results or plots_directory is not None:
+            # Create object points from estimated plane
+            plane_z = np.apply_along_axis(
+                lambda x: ((plane_params[0] + plane_params[1] * x[0]
+                + plane_params[2] * x[1]) * (-1) / plane_params[3]),
+                axis=1, arr=point_cloud_flat[:,:2])
+            plane_points = np.concatenate(
+                (point_cloud_flat[:,:2],
+                np.expand_dims(plane_z, axis=-1)), axis=-1)
+            plane_points_transformed = np.dot(plane_points + translation,
+                                              rotation_matrix.T)
+            print('[*] Estimated plane parameters (w0,w1,w2,w3):', plane_params)
 
-                # Outline the detected plate ellipse and major axis vertices
-                plate_contour = np.copy(img)
-                if (any(x != 0 for x in ellipse_params_scaled) and
-                    plate_diameter_prior != 0):
-                    ellipse_color = (68 / 255, 1 / 255, 84 / 255)
-                    vertex_color = (253 / 255, 231 / 255, 37 / 255)
-                    cv2.ellipse(plate_contour,
-                                (int(ellipse_params_scaled[0]),
-                                 int(ellipse_params_scaled[1])),
-                                (int(ellipse_params_scaled[2]),
-                                 int(ellipse_params_scaled[3])),
-                                ellipse_params_scaled[4] * 180 / np.pi,
-                                0, 360, ellipse_color, 2)
-                    cv2.circle(plate_contour,
-                               (int(plate_point_1[1]), int(plate_point_1[0])),
-                               2, vertex_color, -1)
-                    cv2.circle(plate_contour,
-                               (int(plate_point_2[1]), int(plate_point_2[0])),
-                               2, vertex_color, -1)
+            # Get the color values for the different sets of points
+            colors_flat = (
+                np.reshape(img, (self.model_input_shape[0]
+                                 * self.model_input_shape[1], 3))
+                * 255)
+            object_colors = colors_flat[object_mask_flat, :]
+            non_object_colors= colors_flat[np.logical_not(object_mask_flat), :]
+            object_colors_filtered = object_colors[sor_mask, :]
 
-                # Estimate volume for points above the plane
-                volume_points = object_points_transformed[
-                    object_points_transformed[:,2] > 0]
-                estimated_volume, simplices = pc_to_volume(volume_points)
-                print('[*] Estimated volume:', estimated_volume * 1000, 'L')
-                return_est_volume = estimated_volume * 1000
+            # Outline the detected plate ellipse and major axis vertices
+            plate_contour = np.copy(img)
+            if (any(x != 0 for x in ellipse_params_scaled) and
+                plate_diameter_prior != 0):
+                ellipse_color = (68 / 255, 1 / 255, 84 / 255)
+                vertex_color = (253 / 255, 231 / 255, 37 / 255)
+                cv2.ellipse(plate_contour,
+                            (int(ellipse_params_scaled[0]),
+                             int(ellipse_params_scaled[1])),
+                            (int(ellipse_params_scaled[2]),
+                             int(ellipse_params_scaled[3])),
+                            ellipse_params_scaled[4] * 180 / np.pi,
+                            0, 360, ellipse_color, 2)
+                cv2.circle(plate_contour,
+                           (int(plate_point_1[1]), int(plate_point_1[0])),
+                           2, vertex_color, -1)
+                cv2.circle(plate_contour,
+                           (int(plate_point_2[1]), int(plate_point_2[0])),
+                           2, vertex_color, -1)
 
-                # Create figure of input image and predicted
-                # plate contour, segmentation mask and depth map
-                '''
-                pretty_plotting([img, plate_contour, depth, object_img],
-                                (2,2),
-                                ['Input Image', 'Plate Contour', 'Depth',
-                                 'Object Mask'],
-                                'Estimated Volume: {:.3f} L'.format(
-                                estimated_volume * 1000.0))
-                # Plot and save figure
-                if plot_results:
-                    plt.show()
-                if plots_directory is not None:
-                    if not os.path.exists(plots_directory):
-                        os.makedirs(plots_directory)
-                    (img_name, ext) = os.path.splitext(
-                        os.path.basename(input_image))
-                    filename = '{}_{}{}'.format(img_name, plt.gcf().number,
-                                                ext)
-                    plt.savefig(os.path.join(plots_directory, filename))
+            # Create figure of input image and predicted
+            # plate contour, depth map and object mask
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            axes[0,0].imshow(img)
+            axes[0,0].set_title('Input Image')
+            axes[0,0].axis('off')
+            
+            axes[0,1].imshow(plate_contour)
+            axes[0,1].set_title('Plate Contour')
+            axes[0,1].axis('off')
+            
+            axes[1,0].imshow(depth, cmap='plasma')
+            axes[1,0].set_title('Depth Map')
+            axes[1,0].axis('off')
+            
+            axes[1,1].imshow(object_img)
+            axes[1,1].set_title('Object Region')
+            axes[1,1].axis('off')
+            
+            plt.suptitle('Estimated Volume: {:.3f} L'.format(estimated_volume * 1000.0))
+            plt.tight_layout()
+            
+            # Plot and save figure
+            if plot_results:
+                plt.show()
+            if plots_directory is not None:
+                if not os.path.exists(plots_directory):
+                    os.makedirs(plots_directory)
+                if isinstance(input_image, str):
+                    (img_name, ext) = os.path.splitext(os.path.basename(input_image))
+                else:
+                    img_name = 'image'
+                    ext = '.png'
+                filename = '{}_{}{}'.format(img_name, plt.gcf().number, ext)
+                plt.savefig(os.path.join(plots_directory, filename))
+                plt.close()
 
-                estimated_volumes.append(
-                    (estimated_volume, object_points_df, non_object_points_df,
-                     plane_points_df, object_points_transformed_df,
-                     plane_points_transformed_df, simplices))
-                '''
-            else:
-                # Estimate volume for points above the plane
-                volume_points = object_points_transformed[
-                    object_points_transformed[:,2] > 0]
-                estimated_volume, _ = pc_to_volume(volume_points)
-                return_est_volume = estimated_volume * 1000
-                estimated_volumes.append(estimated_volume)
-
-        return estimated_volumes, return_est_volume
+        return estimated_volume * 1000  # Return volume in liters
 
     def __create_intrinsics_matrix(self, input_image_shape, fov):
         """Create intrinsics matrix from given camera fov.
@@ -465,37 +467,26 @@ if __name__ == '__main__':
     estimator = VolumeEstimator()
 
     # Iterate over input images to estimate volumes
-    results = {'image_path': [], 'volumes': []}
+    results = {'image_path': [], 'volume': []}
     for input_image in estimator.args.input_images:
         print('[*] Input:', input_image)
-        volumes = estimator.estimate_volume(
+        volume = estimator.estimate_volume(
             input_image, estimator.args.fov,
-            estimator.args.plate_diameter_prior, estimator.args.plot_results,
-            estimator.args.plots_directory)
+            estimator.args.plate_diameter_prior, estimator.args.roi,
+            estimator.args.plot_results, estimator.args.plots_directory)
 
         # Store results per input image
         results['image_path'].append(input_image)
-        if (estimator.args.plot_results
-            or estimator.args.plots_directory is not None):
-            results['volumes'].append([x[0] * 1000 for x in volumes])
-            plt.close('all')
-        else:
-            results['volumes'].append(volumes * 1000)
+        results['volume'].append(volume)
 
         # Print weight if density database is given
-        if estimator.args.density_db is not None:
-            db_entry = estimator.density_db.query(
-                estimator.args.food_type)
+        if estimator.args.density_db is not None and estimator.args.food_type is not None:
+            db_entry = estimator.density_db.query(estimator.args.food_type)
             density = db_entry[1]
             print('[*] Density database match:', db_entry)
-            # All foods found in the input image are considered to be
-            # of the same type
-            for v in results['volumes'][-1]:
-                print('[*] Food weight:', 1000 * v * density, 'g')
+            print('[*] Food weight:', volume * density, 'g')
 
     if estimator.args.results_file is not None:
         # Save results in CSV format
         volumes_df = pd.DataFrame(data=results)
         volumes_df.to_csv(estimator.args.results_file, index=False)
-
-
